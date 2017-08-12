@@ -863,7 +863,7 @@ func getModel(str string) (objectname string, m swagger.Schema, realTypes []stri
 		for _, fl := range pkg.Files {
 			for k, d := range fl.Scope.Objects {
 				if d.Kind == ast.Typ {
-					if k != objectname {
+					if k != objectname || pkg.Name != strs[0]{
 						continue
 					}
 					packageName = pkg.Name
