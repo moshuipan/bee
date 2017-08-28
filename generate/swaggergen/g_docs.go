@@ -83,6 +83,9 @@ var stdlibObject = map[string]string{
 	"&{time Time}": "time.Time",
 }
 
+// var file *os.File
+var re *regexp.Regexp
+
 func init() {
 	pkgCache = make(map[string]struct{})
 	controllerComments = make(map[string]string)
@@ -90,6 +93,8 @@ func init() {
 	controllerList = make(map[string]map[string]*swagger.Item)
 	modelsList = make(map[string]map[string]swagger.Schema)
 	astPkgs = map[string]*ast.Package{}
+	// file, _ = os.Create("swagger.txt")
+	re = regexp.MustCompile(`^\d*$`)
 }
 
 func ParsePackagesFromDir(dirpath string) {
@@ -104,11 +109,7 @@ func ParsePackagesFromDir(dirpath string) {
 				return nil
 			}
 
-			// 7 is length of 'vendor' (6) + length of file path separator (1)
-			// so we skip dir 'vendor' which is directly under dirpath
-			if !(len(fpath) == len(dirpath)+7 && strings.HasSuffix(fpath, "vendor")) &&
-				!strings.Contains(fpath, "tests") &&
-				!(len(fpath) > len(dirpath) && fpath[len(dirpath)+1] == '.') {
+			if !strings.Contains(fpath, "vendor") && !strings.Contains(fpath, "tests") {
 				err = parsePackageFromDir(fpath)
 				if err != nil {
 					// Send the error to through the channel and continue walking
@@ -539,7 +540,7 @@ func parserComments(f *ast.FuncDecl, controllerName, pkgpath string) error {
 				respCode, pos := peekNextSplitString(ss)
 				ss = strings.TrimSpace(ss[pos:])
 				respType, pos := peekNextSplitString(ss)
-				if respType == "{object}" || respType == "{array}" {
+				if respType == "{object}" || respType == "{array}" || respType == "{json}" {
 					isArray := respType == "{array}"
 					ss = strings.TrimSpace(ss[pos:])
 					schemaName, pos := peekNextSplitString(ss)
@@ -556,13 +557,109 @@ func parserComments(f *ast.FuncDecl, controllerName, pkgpath string) error {
 						schema.Type = typeFormat[0]
 						schema.Format = typeFormat[1]
 					} else {
-						m, mod, realTypes := getModel(schemaName)
+						// m, mod, realTypes := getModel(schemaName)
+						var m, ref string
+						var mod swagger.Schema
+						var realTypes []string
+						if respType == "{json}" {
+							for _, cc := range comments.List { //get router name
+								t := strings.TrimSpace(strings.TrimLeft(cc.Text, "//"))
+								if strings.HasPrefix(t, "@router") {
+									elements := strings.TrimSpace(t[len("@router"):])
+									e1 := strings.SplitN(elements, " ", 2)
+									if len(e1) < 1 {
+										return errors.New("you should has router infomation")
+									}
+									routerPath = e1[0]
+									if len(e1) == 2 && e1[1] != "" {
+										e1 = strings.SplitN(e1[1], " ", 2)
+										HTTPMethod = strings.ToUpper(strings.Trim(e1[0], "[]"))
+									} else {
+										HTTPMethod = "GET"
+									}
+									ref = pkgpath + controllerName + routerPath + "." + HTTPMethod + respCode //get model name
+									ref = strings.Replace(ref, "/", ".", -1)
+								}
+							}
+							// ref := pkgpath + controllerName
+							jsonTypes := strings.Split(strings.Trim(strings.TrimSpace(schemaName), "{}"), ",")
+							schemaName = ref
+							var define swagger.Schema
+							define.Title = "json map"
+							define.Properties = make(map[string]swagger.Propertie)
+
+							for _, v := range jsonTypes {
+								var propertie swagger.Propertie
+								e := strings.Split(v, ":") //param like {intname:int,objectname:models.Object}
+								if len(e) != 2 {
+									return errors.New("illegal param")
+								}
+								if sType, ok := basicTypes[e[1]]; ok {
+									typeFormat := strings.Split(sType, ":")
+									propertie.Type = typeFormat[0]
+									propertie.Format = typeFormat[1]
+								} else { //object or slice
+									if strings.HasPrefix(e[1], "[]") { //slice
+										propertie.Type = "array"
+										if sType, ok := basicTypes[strings.TrimPrefix(e[1], "[]")]; ok { // basic type slice
+											typeFormat := strings.Split(sType, ":")
+											propertie.Items = &swagger.Propertie{
+												Type:   typeFormat[0],
+												Format: typeFormat[1],
+											}
+										} else { // object  slice
+											mm, _, mrealTypes := getModel(strings.TrimPrefix(e[1], "[]"))
+											propertie.Items = &swagger.Propertie{
+												Ref: "#/definitions/" + mm,
+											}
+											realTypes = append(realTypes, mrealTypes...)
+										}
+									} else if strings.HasPrefix(e[1], "map[string]") { // map
+										beeLogger.Log.Warn("can not support map object")
+										propertie.Type = "object"
+										if sType, ok := basicTypes[strings.TrimPrefix(e[1], "map[string]")]; ok { // basic type slice
+											typeFormat := strings.Split(sType, ":")
+											propertie.AdditionalProperties = &swagger.Propertie{
+												Type:   typeFormat[0],
+												Format: typeFormat[len(typeFormat)-1],
+											}
+										} else {
+											maps := strings.TrimPrefix(e[1], "map[string]")
+											switch {
+											case strings.HasPrefix(maps, "[]"):
+												beeLogger.Log.Warnf("unkonw slice %v", maps)
+											case strings.HasPrefix(maps, "map[string]"):
+												beeLogger.Log.Warnf("unkonw slice %v", maps)
+											default:
+												mm, _, mrealTypes := getModel(maps)
+												propertie.AdditionalProperties = &swagger.Propertie{
+													Ref: "#/definitions/" + mm,
+												}
+												realTypes = append(realTypes, mrealTypes...)
+											}
+										}
+									} else { //object
+										mm, _, mrealTypes := getModel(e[1])
+										propertie.Ref = "#/definitions/" + mm
+										realTypes = append(realTypes, mrealTypes...)
+									}
+								}
+								define.Properties[e[0]] = propertie
+							}
+							m = ref
+							mod = define
+							rootapi.Definitions[m] = define
+						} else {
+							m, mod, realTypes = getModel(schemaName)
+						}
+
 						schema.Ref = "#/definitions/" + m
 						if _, ok := modelsList[pkgpath+controllerName]; !ok {
 							modelsList[pkgpath+controllerName] = make(map[string]swagger.Schema)
 						}
 						modelsList[pkgpath+controllerName][schemaName] = mod
 						appendModels(pkgpath, controllerName, realTypes)
+						realTypes = nil
 					}
 					if isArray {
 						rs.Schema = &swagger.Schema{
@@ -682,6 +779,9 @@ func parserComments(f *ast.FuncDecl, controllerName, pkgpath string) error {
 					opts.Security = make([]map[string][]string, 0)
 				}
 				opts.Security = append(opts.Security, getSecurity(t))
+			} else if strings.HasPrefix(t, "@Noapi") {
+				beeLogger.Log.Infof("got a ignore api")
+				return nil
 			}
 		}
 	}
@@ -711,23 +811,21 @@ func parserComments(f *ast.FuncDecl, controllerName, pkgpath string) error {
 			controllerList[pkgpath+controllerName] = make(map[string]*swagger.Item)
 			item = &swagger.Item{}
 		}
-		for _, hm := range strings.Split(HTTPMethod, ",") {
-			switch hm {
-			case "GET":
-				item.Get = &opts
-			case "POST":
-				item.Post = &opts
-			case "PUT":
-				item.Put = &opts
-			case "PATCH":
-				item.Patch = &opts
-			case "DELETE":
-				item.Delete = &opts
-			case "HEAD":
-				item.Head = &opts
-			case "OPTIONS":
-				item.Options = &opts
-			}
+		switch HTTPMethod {
+		case "GET":
+			item.Get = &opts
+		case "POST":
+			item.Post = &opts
+		case "PUT":
+			item.Put = &opts
+		case "PATCH":
+			item.Patch = &opts
+		case "DELETE":
+			item.Delete = &opts
+		case "HEAD":
+			item.Head = &opts
+		case "OPTIONS":
+			item.Options = &opts
 		}
 		controllerList[pkgpath+controllerName][routerPath] = item
 	}
@@ -863,9 +961,12 @@ func getModel(str string) (objectname string, m swagger.Schema, realTypes []stri
 		for _, fl := range pkg.Files {
 			for k, d := range fl.Scope.Objects {
 				if d.Kind == ast.Typ {
-					if k != objectname || pkg.Name != strs[0]{
+					if k != objectname || pkg.Name != strs[0] {
 						continue
 					}
+					// if k == "Test" && pkg.Name == "controllers" {
+					// 	// file.WriteString(fmt.Sprintf("4\t%v,%v,%v\n", str, k, pkg.Name))
+					// }
 					packageName = pkg.Name
 					parseObject(d, k, &m, &realTypes, astPkgs, pkg.Name)
 				}
@@ -893,13 +994,49 @@ func parseObject(d *ast.Object, k string, m *swagger.Schema, realTypes *[]string
 	// TODO support other types, such as `ArrayType`, `MapType`, `InterfaceType` etc...
 	st, ok := ts.Type.(*ast.StructType)
 	if !ok {
+		var objectname, pkgname1 string
+		a, ok := ts.Type.(*ast.ArrayType)
+		if ok { //slice d
+			elt := strings.Split(strings.Trim(fmt.Sprint(a.Elt), "&{}"), " ")
+			if len(elt) != 2 {
+				beeLogger.Log.Warnf("Invalid default value: %s", strings.Join(elt, ","))
+				return
+			}
+			if re.MatchString(elt[0]) {
+				// file.WriteString(fmt.Sprintf("5\t%v,%v,%v,%v,%v\n", a.Elt, k, packageName, packageName, elt[1]))
+				pkgname1 = packageName
+			} else {
+				pkgname1 = elt[0]
+			}
+			objectname = elt[1]
+			// if (k == "Test" && packageName == "controllers") || (k == "WeekStarHavingSlice" && packageName == "models") || (k == "ModelsTT") {
+			// 	// file.WriteString(fmt.Sprintf("5\t%v,%v,%v,%v,%v\n", a.Elt, k, packageName, pkgname1, objectname))
+			// }
+		}
+		for _, pkg := range astPkgs {
+			for _, fl := range pkg.Files {
+				for kk, dd := range fl.Scope.Objects {
+					if dd.Kind == ast.Typ {
+						if kk != objectname || pkg.Name != pkgname1 {
+							continue
+						}
+						// if k == "Test" && pkg.Name == "controllers" {
+						// 	file.WriteString(fmt.Sprintf("4\t%v,%v,%v\n", str, k, pkg.Name))
+						// }
+						packageName = pkg.Name
+						parseObject(dd, kk, m, realTypes, astPkgs, pkg.Name)
+						return
+					}
+				}
+			}
+		}
 		return
 	}
 	m.Title = k
 	if st.Fields.List != nil {
 		m.Properties = make(map[string]swagger.Propertie)
 		for _, field := range st.Fields.List {
-			isSlice, realType, sType := typeAnalyser(field)
+			isSlice, realType, sType, keyType := typeAnalyser(field)
 			if (isSlice && isBasicType(realType)) || sType == "object" {
 				if len(strings.Split(realType, " ")) > 1 {
 					realType = strings.Replace(realType, " ", ".", -1)
@@ -933,10 +1070,35 @@ func parseObject(d *ast.Object, k string, m *swagger.Schema, realTypes *[]string
 					mp.Type = typeFormat[0]
 					mp.Format = typeFormat[1]
 				} else if realType == "map" {
-					typeFormat := strings.Split(sType, ":")
-					mp.AdditionalProperties = &swagger.Propertie{
-						Type:   typeFormat[0],
-						Format: typeFormat[1],
+					mp.Type = "object"
+					if isBasicType(keyType) { //基础类型map 目前支持map[string]basictype
+						typeFormat := strings.Split(sType, ":")
+						mp.AdditionalProperties = &swagger.Propertie{
+							Type:   typeFormat[0],
+							Format: typeFormat[len(typeFormat)-1],
+						}
+					} else { //对象类型map 目前支持map[string]object
+						//if is struct,$ref else parseObject
+						switch t := field.Type.(type) {
+						case *ast.MapType:
+							switch tt := t.Value.(type) {
+							case *ast.SelectorExpr: //引用了其他包的结构
+								otherModel := fmt.Sprintf("%v.%v", tt.X, tt.Sel.Name)
+								*realTypes = append(*realTypes, otherModel)
+								mp.AdditionalProperties = &swagger.Propertie{
+									Ref: "#/definitions/" + otherModel,
+								}
+							case *ast.Ident: //引用原包的结构
+								otherModel := fmt.Sprintf("%v.%v", packageName, keyType)
+								*realTypes = append(*realTypes, otherModel)
+								mp.AdditionalProperties = &swagger.Propertie{
+									Ref: "#/definitions/" + otherModel,
+								}
+							default: //map or slice
+								// 	beeLogger.Log.Fatalf("%v", tt)
+								mp.AdditionalProperties = getMapOrSlicePropertie(tt, realTypes, packageName)
+							}
+						}
 					}
 				}
 			}
@@ -990,7 +1152,7 @@ func parseObject(d *ast.Object, k string, m *swagger.Schema, realTypes *[]string
 					if required := stag.Get("required"); required != "" {
 						m.Required = append(m.Required, name)
 					}
-					if desc := stag.Get("description"); desc != "" {
+					if desc := stag.Get("desc"); desc != "" {
 						mp.Description = desc
 					}
 
@@ -1014,41 +1176,109 @@ func parseObject(d *ast.Object, k string, m *swagger.Schema, realTypes *[]string
 	}
 }
 
-func typeAnalyser(f *ast.Field) (isSlice bool, realType, swaggerType string) {
+func getMapOrSlicePropertie(tt ast.Expr, realTypes *[]string, pkgname string) *swagger.Propertie { //解析map和slice的递归
+	pp := &swagger.Propertie{}
+	switch ttt := tt.(type) {
+	case *ast.MapType:
+		if isBasicType(fmt.Sprintf("%v", ttt.Value)) {
+			typeformat := strings.Split(basicTypes[fmt.Sprintf("%v", ttt.Value)], ":")
+			pp.Type = "object"
+			pp.AdditionalProperties = &swagger.Propertie{
+				Type:   typeformat[0],
+				Format: typeformat[len(typeformat)-1],
+			}
+			return pp
+		}
+		switch t4 := ttt.Value.(type) {
+		case *ast.SelectorExpr: //其他包的结构体
+			pp.Type = "object"
+			otherModel := fmt.Sprintf("%v.%v", t4.X, t4.Sel.Name)
+			*realTypes = append(*realTypes, otherModel)
+			pp.AdditionalProperties = &swagger.Propertie{
+				Ref: "#/definitions/" + otherModel,
+			}
+		case *ast.Ident: //原包的结构体
+			pp.Type = "object"
+			otherModel := fmt.Sprintf("%v.%v", pkgname, t4.Name)
+			*realTypes = append(*realTypes, otherModel)
+			pp.AdditionalProperties = &swagger.Propertie{
+				Ref: "#/definitions/" + otherModel,
+			}
+		case *ast.ArrayType, *ast.MapType:
+			pp.Type = "object"
+			pp.AdditionalProperties = getMapOrSlicePropertie(t4, realTypes, pkgname)
+		default:
+			beeLogger.Log.Warnf("unkonw type of %v\n", t4)
+		}
+	case *ast.ArrayType:
+		pp.Type = "array"
+		if isBasicType(fmt.Sprintf("%v", ttt.Elt)) {
+			typeformat := strings.Split(basicTypes[fmt.Sprintf("%v", ttt.Elt)], ":")
+			pp.Items = &swagger.Propertie{
+				Type:   typeformat[0],
+				Format: typeformat[len(typeformat)-1],
+			}
+			return pp
+		}
+		switch t4 := ttt.Elt.(type) {
+		case *ast.SelectorExpr: //其他包的结构体
+			otherModel := fmt.Sprintf("%v.%v", t4.X, t4.Sel.Name)
+			*realTypes = append(*realTypes, otherModel)
+			pp.Items = &swagger.Propertie{
+				Ref: "#/definitions/" + otherModel,
+			}
+		case *ast.Ident: //原包的结构体
+			otherModel := fmt.Sprintf("%v.%v", pkgname, t4.Name)
+			*realTypes = append(*realTypes, otherModel)
+			pp.Items = &swagger.Propertie{
+				Ref: "#/definitions/" + otherModel,
+			}
+		case *ast.ArrayType, *ast.MapType:
+			pp.Items = getMapOrSlicePropertie(t4, realTypes, pkgname)
+		default:
+			beeLogger.Log.Warnf("unkonw type of %v\n", t4)
+		}
+	default:
+		beeLogger.Log.Warnf("unkonw type of %v\n", ttt)
+	}
+	return pp
+}
+
+func typeAnalyser(f *ast.Field) (isSlice bool, realType, swaggerType, keType string) {
 	if arr, ok := f.Type.(*ast.ArrayType); ok {
 		if isBasicType(fmt.Sprint(arr.Elt)) {
-			return true, fmt.Sprintf("[]%v", arr.Elt), basicTypes[fmt.Sprint(arr.Elt)]
+			return true, fmt.Sprintf("[]%v", arr.Elt), basicTypes[fmt.Sprint(arr.Elt)], ""
 		}
 		if mp, ok := arr.Elt.(*ast.MapType); ok {
-			return false, fmt.Sprintf("map[%v][%v]", mp.Key, mp.Value), "object"
+			return false, fmt.Sprintf("map[%v][%v]", mp.Key, mp.Value), "object", ""
 		}
 		if star, ok := arr.Elt.(*ast.StarExpr); ok {
-			return true, fmt.Sprint(star.X), "object"
+			return true, fmt.Sprint(star.X), "object", ""
 		}
-		return true, fmt.Sprint(arr.Elt), "object"
+		return true, fmt.Sprint(arr.Elt), "object", ""
 	}
 	switch t := f.Type.(type) {
 	case *ast.StarExpr:
 		basicType := fmt.Sprint(t.X)
 		if k, ok := basicTypes[basicType]; ok {
-			return false, basicType, k
+			return false, basicType, k, ""
 		}
-		return false, basicType, "object"
+		return false, basicType, "object", ""
 	case *ast.MapType:
 		val := fmt.Sprintf("%v", t.Value)
 		if isBasicType(val) {
-			return false, "map", basicTypes[val]
+			return false, "map", basicTypes[val], val
 		}
-		return false, val, "object"
+		return false, "map", val, val
 	}
 	basicType := fmt.Sprint(f.Type)
 	if object, isStdLibObject := stdlibObject[basicType]; isStdLibObject {
 		basicType = object
 	}
 	if k, ok := basicTypes[basicType]; ok {
-		return false, basicType, k
+		return false, basicType, k, ""
 	}
-	return false, basicType, "object"
+	return false, basicType, "object", ""
 }
 
 func isBasicType(Type string) bool {
