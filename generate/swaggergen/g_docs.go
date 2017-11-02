@@ -490,13 +490,44 @@ func isSystemPackage(pkgpath string) bool {
 	return utils.FileExists(wg)
 }
 
-func peekNextSplitString(ss string) (s string, spacePos int) {
-	spacePos = strings.IndexFunc(ss, unicode.IsSpace)
-	if spacePos < 0 {
-		s = ss
-		spacePos = len(ss)
+func peekNextSplitString(ss, flag string) (s string, spacePos int) {
+	if flag != "json" {
+		spacePos = strings.IndexFunc(ss, unicode.IsSpace)
+		if spacePos < 0 {
+			s = ss
+			spacePos = len(ss)
+		} else {
+			s = strings.TrimSpace(ss[:spacePos])
+		}
 	} else {
-		s = strings.TrimSpace(ss[:spacePos])
+		_, end := matchBrace(strings.TrimSpace(ss))
+		s = strings.TrimSpace(ss)[:end+1]
+		spacePos = end + 1
+	}
+	return
+}
+
+// {} match
+func matchBrace(s string) (begin, end int) {
+	ss := []rune(s)
+	var left, right int
+	for i, c := range ss {
+		if c == '{' {
+			left++
+			if left == 1 {
+				begin = i
+			}
+		}
+		if c == '}' {
+			right++
+			if left == right {
+				end = i
+				break
+			}
+		}
+	}
+	if left != right {
+		beeLogger.Log.Fatal("match brace {}:" + s)
 	}
 	return
 }
@@ -531,19 +562,20 @@ func parserComments(f *ast.FuncDecl, controllerName, pkgpath string) error {
 			} else if strings.HasPrefix(t, "@Title") {
 				opts.OperationID = controllerName + "." + strings.TrimSpace(t[len("@Title"):])
 			} else if strings.HasPrefix(t, "@Description") {
+				opts.Summary = strings.TrimSpace(t[len("@Description"):])
 				opts.Description = strings.TrimSpace(t[len("@Description"):])
 			} else if strings.HasPrefix(t, "@Summary") {
 				opts.Summary = strings.TrimSpace(t[len("@Summary"):])
 			} else if strings.HasPrefix(t, "@Success") {
 				ss := strings.TrimSpace(t[len("@Success"):])
 				rs := swagger.Response{}
-				respCode, pos := peekNextSplitString(ss)
+				respCode, pos := peekNextSplitString(ss, "")
 				ss = strings.TrimSpace(ss[pos:])
-				respType, pos := peekNextSplitString(ss)
+				respType, pos := peekNextSplitString(ss, "")
 				if respType == "{object}" || respType == "{array}" || respType == "{json}" {
 					isArray := respType == "{array}"
 					ss = strings.TrimSpace(ss[pos:])
-					schemaName, pos := peekNextSplitString(ss)
+					schemaName, pos := peekNextSplitString(ss, "json")
 					if schemaName == "" {
 						beeLogger.Log.Fatalf("[%s.%s] Schema must follow {object} or {array}", controllerName, funcName)
 					}
@@ -587,13 +619,14 @@ func parserComments(f *ast.FuncDecl, controllerName, pkgpath string) error {
 							var define swagger.Schema
 							define.Title = "json map"
 							define.Properties = make(map[string]swagger.Propertie)
-
 							for _, v := range jsonTypes {
 								var propertie swagger.Propertie
 								e := strings.Split(v, ":") //param like {intname:int,objectname:models.Object}
 								if len(e) != 2 {
 									return errors.New("illegal param")
 								}
+								e[0] = strings.TrimSpace(e[0])
+								e[1] = strings.TrimSpace(e[1])
 								if sType, ok := basicTypes[e[1]]; ok {
 									typeFormat := strings.Split(sType, ":")
 									propertie.Type = typeFormat[0]
@@ -780,7 +813,7 @@ func parserComments(f *ast.FuncDecl, controllerName, pkgpath string) error {
 				}
 				opts.Security = append(opts.Security, getSecurity(t))
 			} else if strings.HasPrefix(t, "@Noapi") {
-				beeLogger.Log.Infof("got a ignore api")
+				// beeLogger.Log.Infof("got a ignore api")
 				return nil
 			}
 		}
@@ -1034,7 +1067,9 @@ func parseObject(d *ast.Object, k string, m *swagger.Schema, realTypes *[]string
 	}
 	m.Title = k
 	if st.Fields.List != nil {
-		m.Properties = make(map[string]swagger.Propertie)
+		if m.Properties == nil {
+			m.Properties = make(map[string]swagger.Propertie)
+		}
 		for _, field := range st.Fields.List {
 			isSlice, realType, sType, keyType := typeAnalyser(field)
 			if (isSlice && isBasicType(realType)) || sType == "object" {
